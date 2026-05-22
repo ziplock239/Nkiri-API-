@@ -1,0 +1,7 @@
+flask==3.0.3
+flask-cors==4.0.1
+flask-limiter==3.7.0
+cloudscraper==1.2.71
+beautifulsoup4==4.12.3
+lxml==5.2.2
+gunicorn==22.0.0

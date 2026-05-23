@@ -493,13 +493,56 @@ def debug():
         soup = BeautifulSoup(body,"lxml")
         omg_links = find_omg10_links(soup, body)
         dw_links = [m.group(0) for m in re.finditer(r'https?://(?:www\.)?downloadwella\.com/[^\s\'"<>\\]+', body)]
+
+        # Dump full entry-content HTML so we can see how download links are stored
+        content_el = soup.select_one(".entry-content,.post-content")
+        content_html = str(content_el) if content_el else ""
+
+        # Search for encoded/obfuscated URLs in full HTML
+        encoded_findings = {}
+        # atob() base64 calls
+        atob_matches = re.findall(r'atob\(["\']([A-Za-z0-9+/=]{20,})["\'])', body)
+        if atob_matches:
+            import base64
+            decoded = []
+            for m in atob_matches[:5]:
+                try: decoded.append(base64.b64decode(m).decode(errors="replace"))
+                except: pass
+            encoded_findings["atob_decoded"] = decoded
+
+        # data-link / data-url / data-href attributes
+        data_attrs = []
+        for tag in soup.find_all(True):
+            for attr in ["data-link","data-url","data-href","data-src","data-file","data-download"]:
+                val = tag.get(attr,"")
+                if val and len(val) > 5:
+                    data_attrs.append({"tag":tag.name,"attr":attr,"value":val[:200]})
+        encoded_findings["data_attributes"] = data_attrs[:20]
+
+        # onclick handlers with URLs
+        onclick_urls = []
+        for tag in soup.find_all(True, onclick=True):
+            oc = tag.get("onclick","")
+            if "http" in oc:
+                onclick_urls.append({"tag":tag.name,"onclick":oc[:200]})
+        encoded_findings["onclick_with_urls"] = onclick_urls[:10]
+
+        # window.open / location.href in scripts
+        js_urls = []
+        for script in soup.find_all("script"):
+            t = script.string or ""
+            for m in re.finditer(r'(?:window\.open|location\.href|location\.replace)\s*[=(]["\']([^"\']{10,})["\'])', t):
+                js_urls.append(m.group(1)[:200])
+        encoded_findings["js_redirects"] = js_urls[:10]
+
         return jsonify({
             "status_code": r.status_code,
             "content_encoding": r.headers.get("Content-Encoding","none"),
             "decoded_html_length": len(body),
             "html_snippet": body[:3000],
+            "entry_content_html": content_html[:5000],   # FULL content area HTML
             "articles_found": len(soup.find_all("article")),
-            "entry_content_found": bool(soup.select_one(".entry-content")),
+            "entry_content_found": bool(content_el),
             "all_links_count": len(soup.find_all("a", href=True)),
             "all_links": [{"text":a.get_text(strip=True)[:80],"href":a["href"][:200]}
                           for a in soup.find_all("a", href=True)][:80],
@@ -510,6 +553,7 @@ def debug():
                           for f in soup.find_all("form")],
             "omg10_links": omg_links,
             "downloadwella_links_in_html": dw_links,
+            "encoded_findings": encoded_findings,
         })
     except Exception as e:
         import traceback

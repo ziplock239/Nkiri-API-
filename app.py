@@ -1,14 +1,14 @@
 """
 Nkiri API
 =========
-GET /api/movies                          - latest movies (paginated)
+GET /api/movies                    - latest movies (paginated)
 GET /api/movies?page=2
-GET /api/movies?category=hollywood
+GET /api/movies?category=k-drama
 GET /api/search?q=avatar
 GET /api/movie?url=PAGE_URL
 GET /api/download?url=PAGE_URL
 GET /api/health
-GET /api/debug?url=...                   - remove after debugging
+GET /api/debug?url=...
 """
 
 import re
@@ -16,7 +16,7 @@ import time
 import gzip
 import zlib
 import logging
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -31,7 +31,6 @@ try:
 except ImportError:
     HAS_BROTLI = False
 
-# ─── App setup ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
 limiter = Limiter(get_remote_address, app=app, default_limits=["300 per hour"], storage_uri="memory://")
@@ -40,7 +39,6 @@ log = logging.getLogger("nkiri")
 
 BASE = "https://thenkiri.com.ng"
 FILE_EXT_RE = re.compile(r'\.(mp4|mkv|avi|mov|webm)(\?|#|$)', re.I)
-
 
 # ─── Session + decode ─────────────────────────────────────────────────────────
 def make_session():
@@ -59,47 +57,32 @@ def make_session():
 
 
 def decode_body(r) -> str:
-    """
-    Manually decompress the raw response bytes.
-    cloudscraper sometimes hands back undecoded compressed bytes — this fixes it.
-    """
-    raw = r.content  # always raw bytes
-
-    # 1. Brotli
+    raw = r.content
     if HAS_BROTLI:
         try:
             return brotli.decompress(raw).decode("utf-8", errors="replace")
         except Exception:
             pass
-
-    # 2. Gzip
     try:
         return gzip.decompress(raw).decode("utf-8", errors="replace")
     except Exception:
         pass
-
-    # 3. Zlib / deflate (with or without header)
     for wbits in (15, -15, 47):
         try:
             return zlib.decompress(raw, wbits).decode("utf-8", errors="replace")
         except Exception:
             pass
-
-    # 4. Already plain text
     return r.text
 
 
-def nkiri_get(s, url, timeout=30) -> tuple:
-    """GET a URL; returns (requests.Response, decoded_html_str)"""
+def nkiri_get(s, url, timeout=30):
     s.headers["Referer"] = BASE
     r = s.get(url, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
-    body = decode_body(r)
-    return r, body
+    return r, decode_body(r)
 
 
-def dw_post(s, url, data, referer, timeout=30) -> tuple:
-    """POST to downloadwella; returns (requests.Response, decoded_html_str)"""
+def dw_post(s, url, data, referer, timeout=30):
     s.headers.update({
         "Referer": referer,
         "Origin": urlparse(url).scheme + "://" + urlparse(url).netloc,
@@ -107,8 +90,7 @@ def dw_post(s, url, data, referer, timeout=30) -> tuple:
     })
     r = s.post(url, data=data, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
-    body = decode_body(r)
-    return r, body
+    return r, decode_body(r)
 
 
 def is_nkiri(url):
@@ -116,19 +98,48 @@ def is_nkiri(url):
 
 
 # ─── Movie card parser ────────────────────────────────────────────────────────
-def parse_movie_cards(soup) -> list[dict]:
-    # Nkiri uses a theme with NO <article> tags.
-    # Movies are plain <a href="/slug/"> links.
-    # Identify them by their URL slug pattern.
-    MOVIE_SLUG_RE = re.compile(
-        r'https://thenkiri\.com\.ng/[a-z0-9][\w-]+'
-        r'(?:download|korean-drama|tv-series|chinese-drama|thai-drama|k-drama|'
-        r'bollywood|nollywood|hollywood|anime|foreign|s\d{2})[\w-]*/?\s*$',
-        re.I
-    )
+# Confirmed from debug: movies are plain <a> links, no <article> on homepage.
+# Movie page HAS articles (post-XXXX class) but first link is category, not movie.
+# Safest: match by URL slug pattern confirmed from real debug data.
 
+MOVIE_URL_RE = re.compile(
+    r'https://thenkiri\.com\.ng/([a-z0-9][a-z0-9-]+)/$',
+    re.I
+)
+
+# Slugs to exclude even if they match the URL pattern
+EXCLUDE_SLUGS = {
+    "login-secure", "wp-login", "wp-admin", "feed", "sitemap",
+    "contact", "about", "privacy-policy", "terms",
+}
+
+# Keywords that confirm a slug is a movie/show post
+CONTENT_KEYWORDS = re.compile(
+    r'\b(download|korean-drama|tv-series|chinese-drama|thai-drama|k-drama|'
+    r'hollywood|nollywood|bollywood|foreign|anime|movie|drama|series|'
+    r's\d{2}|episode)\b',
+    re.I
+)
+
+
+def parse_movie_cards(soup) -> list[dict]:
     movies = []
     seen_urls = set()
+
+    # Build a map of url → thumbnail from ALL images on the page
+    # Nkiri wraps each post card in a div that contains both the <a> and <img>
+    thumb_map = {}
+    for img in soup.find_all("img"):
+        src = (img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")).strip()
+        if not src or src.startswith("data:") or len(src) < 20:
+            continue
+        # Walk up to find the nearest ancestor that also has a link
+        parent = img.find_parent(["div", "li", "article", "figure"])
+        if parent:
+            for a in parent.find_all("a", href=True):
+                href = a["href"].strip()
+                if href and href not in thumb_map:
+                    thumb_map[href] = src
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -136,27 +147,21 @@ def parse_movie_cards(soup) -> list[dict]:
 
         if not href or href in seen_urls:
             continue
-        if not href.startswith("https://thenkiri.com.ng/"):
+        if not text:
             continue
-        if any(x in href for x in ["/category/", "/tag/", "/page/", "/?", "#", "/login", "/wp-"]):
+
+        m = MOVIE_URL_RE.match(href)
+        if not m:
             continue
-        if not text or len(text) < 5:
+
+        slug = m.group(1)
+        if slug in EXCLUDE_SLUGS:
             continue
-        if not MOVIE_SLUG_RE.search(href):
+        if not CONTENT_KEYWORDS.search(slug):
             continue
 
         seen_urls.add(href)
-
-        # Find nearby thumbnail
-        thumb = ""
-        parent = a.find_parent(["div", "li", "article", "figure"])
-        if parent:
-            img = parent.find("img")
-            if img:
-                thumb = (img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")).strip()
-                if thumb and (thumb.startswith("data:") or len(thumb) < 20):
-                    thumb = ""
-
+        thumb = thumb_map.get(href, "")
         movies.append({"title": text, "url": href, "thumbnail": thumb})
 
     return movies
@@ -176,9 +181,12 @@ def parse_movie_info(soup, page_url: str) -> dict:
     if og:
         thumbnail = og.get("content", "")
     if not thumbnail:
-        img = soup.select_one(".entry-content img, .post-thumbnail img, article img")
-        if img:
-            thumbnail = (img.get("data-src") or img.get("src", "")).strip()
+        # Use the post's own featured image (first article img)
+        art = soup.select_one("article")
+        if art:
+            img = art.find("img")
+            if img:
+                thumbnail = (img.get("data-src") or img.get("src", "")).strip()
 
     description = ""
     for attr in [{"property": "og:description"}, {"name": "description"}]:
@@ -209,14 +217,46 @@ def parse_movie_info(soup, page_url: str) -> dict:
             "description": description, "details": details}
 
 
+# ─── Download link extractor ──────────────────────────────────────────────────
+def extract_dw_urls_from_html(html: str) -> list[str]:
+    """
+    Find ALL downloadwella.com URLs in raw HTML — including those buried
+    in JavaScript variables, onclick handlers, data attributes, etc.
+    Nkiri loads download links via JS so they won't appear as plain <a> tags.
+    """
+    # Match any downloadwella.com URL in the entire raw HTML
+    pattern = re.compile(
+        r'https?://(?:www\.)?downloadwella\.com/[^\s\'"<>\]\\]+',
+        re.I
+    )
+    found = []
+    seen = set()
+    for m in pattern.finditer(html):
+        url = m.group(0).rstrip(".,;)")  # strip trailing punctuation
+        # Only keep file page URLs (not homepage/nav)
+        if re.search(r'/[a-z0-9]{8,}/', url, re.I):  # has file ID segment
+            if url not in seen:
+                seen.add(url)
+                found.append(url)
+    return found
+
+
+def extract_label_for_dw_url(url: str, html: str) -> str:
+    """Try to find a label near this URL in the raw HTML."""
+    idx = html.find(url)
+    if idx == -1:
+        return "Download"
+    # Look at surrounding 300 chars for quality keywords
+    context = html[max(0, idx-200):idx+200]
+    for q in ["2160p", "4K", "1080p", "720p", "480p", "360p", "BluRay", "WEBRip", "HDCAM"]:
+        if q.lower() in context.lower():
+            return f"Download {q}"
+    return "Download"
+
+
 # ─── Downloadwella resolver ───────────────────────────────────────────────────
 def resolve_downloadwella(s, dw_url: str) -> str | None:
-    """
-    Confirmed flow from debug output:
-      - GET page already has form with op=download2, id=FILE_ID pre-filled
-      - POST that form → follow redirect → direct .mkv/.mp4 URL
-    """
-    log.info(f"  dw: {dw_url}")
+    log.info(f"  dw resolve: {dw_url}")
     host_base = urlparse(dw_url).scheme + "://" + urlparse(dw_url).netloc
 
     try:
@@ -225,7 +265,7 @@ def resolve_downloadwella(s, dw_url: str) -> str | None:
 
         form = soup1.find("form")
         if not form:
-            log.warning("  No form on downloadwella page")
+            log.warning("  no form on dw page")
             return None
 
         data = {}
@@ -245,33 +285,30 @@ def resolve_downloadwella(s, dw_url: str) -> str | None:
         log.info(f"  POST {post_url} data={data}")
         r2, body2 = dw_post(s, post_url, data, referer=dw_url)
 
-        # Check redirect chain for direct file URL
+        # Check redirect chain
         for resp in list(r2.history) + [r2]:
             if FILE_EXT_RE.search(resp.url):
                 log.info(f"  resolved via redirect: {resp.url}")
                 return resp.url
 
-        # Scan response HTML
+        # Scan response for direct file link
         soup2 = BeautifulSoup(body2, "lxml")
         for a in soup2.find_all("a", href=True):
             if FILE_EXT_RE.search(a["href"]) and a["href"].startswith("http"):
-                log.info(f"  resolved via anchor: {a['href']}")
                 return a["href"]
 
-        # Scan scripts
         for script in soup2.find_all("script"):
             t = script.string or ""
             m = re.search(r'["\']((https?://[^"\']{10,}\.(?:mp4|mkv|avi|webm))[^"\']*)["\']', t, re.I)
             if m:
-                log.info(f"  resolved via JS: {m.group(1)}")
                 return m.group(1)
 
-        # Check Location header
-        loc = r2.headers.get("Location", "")
-        if FILE_EXT_RE.search(loc):
-            return loc
+        # Also scan raw body2 for file URLs
+        m = re.search(r'https?://[^\s"\'<>]+\.(?:mp4|mkv|avi|webm)[^\s"\'<>]*', body2, re.I)
+        if m:
+            return m.group(0)
 
-        log.warning(f"  dw could not resolve. body snippet: {body2[:300]}")
+        log.warning(f"  dw could not resolve. body snippet: {body2[:400]}")
         return None
 
     except Exception as e:
@@ -279,51 +316,26 @@ def resolve_downloadwella(s, dw_url: str) -> str | None:
         return None
 
 
-# ─── Download link collector ──────────────────────────────────────────────────
-def get_download_links(s, nkiri_url: str) -> tuple[str, list[dict]]:
-    """Returns (title, links)"""
-    _, body = nkiri_get(s, nkiri_url)
+# ─── Main download collector ──────────────────────────────────────────────────
+def get_download_links(s, nkiri_url: str):
+    r, body = nkiri_get(s, nkiri_url)
     soup = BeautifulSoup(body, "lxml")
-
     info = parse_movie_info(soup, nkiri_url)
     title = info.get("title", "")
 
-    content = (
-        soup.select_one(".entry-content")
-        or soup.select_one(".post-content")
-        or soup.select_one("article")
-        or soup
-    )
-
-    dw_links, direct_links = [], []
-    seen = set()
-
-    for a in content.find_all("a", href=True):
-        href = a["href"].strip()
-        label = a.get_text(strip=True)
-        if not href or href in seen or href.startswith("javascript") or href == "#":
-            continue
-        if "thenkiri.com.ng" in href:
-            continue
-        seen.add(href)
-        if "downloadwella.com" in href:
-            dw_links.append({"href": href, "label": label})
-        elif FILE_EXT_RE.search(href) and href.startswith("http"):
-            direct_links.append({
-                "label": label or "Direct Download",
-                "url": href,
-                "host": urlparse(href).netloc.replace("www.", ""),
-                "filename": href.split("/")[-1].split("?")[0],
-                "size": "",
-            })
+    # Search the ENTIRE raw HTML for downloadwella URLs
+    # (they are injected via JS so won't appear as plain anchor tags)
+    dw_urls = extract_dw_urls_from_html(body)
+    log.info(f"  found {len(dw_urls)} downloadwella URLs in raw HTML")
 
     results = []
-    for item in dw_links:
-        direct_url = resolve_downloadwella(s, item["href"])
+    for dw_url in dw_urls:
+        label = extract_label_for_dw_url(dw_url, body)
+        direct_url = resolve_downloadwella(s, dw_url)
         if direct_url:
-            filename = direct_url.split("/")[-1].split("?")[0]
+            filename = unquote(direct_url.split("/")[-1].split("?")[0])
             results.append({
-                "label": item["label"] or filename or "Download",
+                "label": label,
                 "url": direct_url,
                 "host": urlparse(direct_url).netloc.replace("www.", ""),
                 "filename": filename,
@@ -331,13 +343,28 @@ def get_download_links(s, nkiri_url: str) -> tuple[str, list[dict]]:
             })
         else:
             results.append({
-                "label": item["label"] or "Download",
-                "url": item["href"],
+                "label": label,
+                "url": dw_url,
                 "host": "downloadwella.com",
-                "filename": "", "size": "",
-                "note": "direct link resolution failed — downloadwella page returned",
+                "filename": "",
+                "size": "",
+                "note": "direct link resolution failed",
             })
-    results.extend(direct_links)
+
+    # Also catch any plain direct links in content area
+    content = soup.select_one(".entry-content, .post-content") or soup
+    for a in content.find_all("a", href=True):
+        href = a["href"].strip()
+        if FILE_EXT_RE.search(href) and href.startswith("http"):
+            if "thenkiri" not in href:
+                results.append({
+                    "label": a.get_text(strip=True) or "Direct Download",
+                    "url": href,
+                    "host": urlparse(href).netloc.replace("www.", ""),
+                    "filename": href.split("/")[-1].split("?")[0],
+                    "size": "",
+                })
+
     return title, results
 
 
@@ -353,7 +380,7 @@ def all_movies():
     else:
         url = BASE if page == "1" else f"{BASE}/page/{page}/"
 
-    log.info(f"MOVIES category={category!r} page={page} → {url}")
+    log.info(f"MOVIES category={category!r} page={page}")
     try:
         s = make_session()
         _, body = nkiri_get(s, url)
@@ -366,10 +393,10 @@ def all_movies():
     next_page = str(int(page) + 1) if has_next else None
 
     cats, seen_slugs = [], set()
-    for a in soup.select(".cat-item a, .categories a, nav .menu-item a"):
+    for a in soup.find_all("a", href=True):
         href = a.get("href", "")
-        m = re.search(r"/category/([^/]+)/?", href)
-        if m and m.group(1) not in seen_slugs:
+        m = re.search(r"/category/([^/]+)/?$", href)
+        if m and m.group(1) not in seen_slugs and "uncategorized" not in m.group(1):
             seen_slugs.add(m.group(1))
             cats.append({"name": a.get_text(strip=True), "slug": m.group(1)})
 
@@ -433,7 +460,7 @@ def download():
         title, links = get_download_links(s, page_url)
     except Exception as e:
         log.error(f"Download error: {e}")
-        return jsonify({"error": "Failed to resolve download links", "detail": str(e)}), 502
+        return jsonify({"error": "Failed to resolve links", "detail": str(e)}), 502
 
     return jsonify({
         "title": title, "url": page_url,
@@ -449,7 +476,6 @@ def health():
 
 @app.route("/api/debug")
 def debug():
-    """Temporary debug endpoint — delete once working."""
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"error": "url required"}), 400
@@ -478,14 +504,12 @@ def debug():
                 "img": (img.get("data-src") or img.get("src", ""))[:200] if img else None,
             })
 
-        # Also show what compression was actually used
-        ce = r.headers.get("Content-Encoding", "none")
-        ct = r.headers.get("Content-Type", "")
+        # Show downloadwella URLs found in raw HTML
+        dw_urls = extract_dw_urls_from_html(body)
 
         return jsonify({
             "status_code": r.status_code,
-            "content_encoding": ce,
-            "content_type": ct,
+            "content_encoding": r.headers.get("Content-Encoding", "none"),
             "final_url": r.url,
             "raw_bytes_length": len(r.content),
             "decoded_html_length": len(body),
@@ -494,8 +518,9 @@ def debug():
             "articles_sample": articles,
             "entry_content_found": bool(soup.select_one(".entry-content")),
             "all_links_count": len(links),
-            "all_links": links[:60],
+            "all_links": links[:80],
             "all_forms": forms,
+            "downloadwella_urls_in_raw_html": dw_urls,  # ← KEY: shows JS-loaded DW links
         })
     except Exception as e:
         import traceback

@@ -548,5 +548,79 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/debug")
+def debug():
+    """
+    TEMPORARY — dumps raw HTML from a URL so we can see what the server actually receives.
+    Usage:
+      GET /api/debug?url=https://thenkiri.com.ng/avatar/
+      GET /api/debug?url=https://thenkiri.com.ng/
+      GET /api/debug?url=https://downloadwella.com/g2jm30mfdu7b/Project.Hail.Mary.(THENKIRI.COM).2026.WEBRip.DOWNLOADED.FROM.THENKIRI.COM.mkv.html
+
+    Returns raw HTML + all links and forms found on the page.
+    DELETE this endpoint once scraping is confirmed working.
+    """
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "url required"}), 400
+
+    try:
+        s = session()
+        r = s.get(url, timeout=30)
+        html = r.text
+        soup = BeautifulSoup(html, "lxml")
+
+        # All links on the page
+        all_links = []
+        for a in soup.find_all("a", href=True):
+            all_links.append({
+                "text": a.get_text(strip=True)[:80],
+                "href": a["href"][:200],
+            })
+
+        # All forms + their inputs
+        all_forms = []
+        for form in soup.find_all("form"):
+            inputs = []
+            for inp in form.find_all("input"):
+                inputs.append({
+                    "type": inp.get("type"),
+                    "name": inp.get("name"),
+                    "value": (inp.get("value") or "")[:100],
+                })
+            all_forms.append({
+                "action": form.get("action"),
+                "method": form.get("method"),
+                "inputs": inputs,
+            })
+
+        # Article tags found (for movie card parsing)
+        articles = []
+        for art in soup.find_all("article")[:5]:
+            a = art.find("a", href=True)
+            img = art.find("img")
+            articles.append({
+                "classes": art.get("class", []),
+                "first_link": a["href"] if a else None,
+                "first_link_text": a.get_text(strip=True)[:80] if a else None,
+                "img_src": (img.get("data-src") or img.get("src", ""))[:200] if img else None,
+            })
+
+        return jsonify({
+            "status_code": r.status_code,
+            "final_url": r.url,
+            "html_length": len(html),
+            "html_snippet": html[:3000],
+            "all_links": all_links[:60],
+            "all_forms": all_forms,
+            "articles_found": len(soup.find_all("article")),
+            "articles_sample": articles,
+            "entry_content_found": bool(soup.select_one(".entry-content")),
+            "post_content_found": bool(soup.select_one(".post-content")),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

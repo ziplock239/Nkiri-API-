@@ -501,7 +501,7 @@ def debug():
         # Search for encoded/obfuscated URLs in full HTML
         encoded_findings = {}
         # atob() base64 calls
-        atob_matches = re.findall(r'atob\(["\']([A-Za-z0-9+/=]{20,})["\'])', body)
+        atob_matches = re.findall(r"atob\([\"']([ A-Za-z0-9+/=]{20,})[\"']\)", body)
         if atob_matches:
             import base64
             decoded = []

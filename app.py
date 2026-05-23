@@ -1,18 +1,23 @@
 """
 Nkiri API
 =========
-Endpoints:
-  GET /api/search?q=query           - search movies
-  GET /api/movies                   - all / latest movies (paginated)
-  GET /api/movie?url=PAGE_URL       - single movie info
-  GET /api/download?url=PAGE_URL    - fresh direct download links (live, never cached)
+GET /api/movies                          - latest movies (paginated)
+GET /api/movies?page=2                   - next page
+GET /api/movies?category=hollywood       - by category
+GET /api/search?q=avatar                 - search
+GET /api/movie?url=PAGE_URL              - single movie info
+GET /api/download?url=PAGE_URL          - fresh direct download links
+GET /api/health                          - health check
 """
 
 import re
 import time
 import logging
+import zlib
+import brotli
 from urllib.parse import urljoin, urlparse
 
+import requests
 import cloudscraper
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
@@ -20,103 +25,100 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-# ─── Setup ────────────────────────────────────────────────────────────────────
+# ─── App setup ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
-limiter = Limiter(get_remote_address, app=app, default_limits=["200 per hour"], storage_uri="memory://")
+limiter = Limiter(get_remote_address, app=app, default_limits=["300 per hour"], storage_uri="memory://")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("nkiri")
 
 BASE = "https://thenkiri.com.ng"
 FILE_EXT_RE = re.compile(r'\.(mp4|mkv|avi|mov|webm)(\?|#|$)', re.I)
 
-# ─── Session ──────────────────────────────────────────────────────────────────
-def session():
+# ─── Session factory ──────────────────────────────────────────────────────────
+def make_session():
     s = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False},
-        delay=5
+        delay=3,
     )
+    # Accept-Encoding: identity forces plain text — no gzip/brotli garbling
     s.headers.update({
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "identity",   # ← KEY: disables compression so we get plain HTML
         "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
+        "Cache-Control": "no-cache",
     })
     return s
 
-def get(s, url, **kw):
-    kw.setdefault("timeout", 30)
-    s.headers.update({"Referer": BASE})
-    r = s.get(url, **kw)
+def fetch(s, url, timeout=30):
+    s.headers["Referer"] = BASE
+    r = s.get(url, timeout=timeout)
     r.raise_for_status()
     return r
 
-def post(s, url, data, referer=None, **kw):
-    kw.setdefault("timeout", 30)
+def fetch_post(s, url, data, referer, timeout=30):
     s.headers.update({
-        "Referer": referer or url,
+        "Referer": referer,
         "Origin": urlparse(url).scheme + "://" + urlparse(url).netloc,
         "Content-Type": "application/x-www-form-urlencoded",
     })
-    r = s.post(url, data=data, **kw)
+    r = s.post(url, data=data, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
     return r
 
 def is_nkiri(url):
     return "thenkiri.com.ng" in urlparse(url).netloc
 
-# ─── Parse helpers ────────────────────────────────────────────────────────────
+# ─── Movie card parser ────────────────────────────────────────────────────────
 def parse_movie_cards(soup) -> list[dict]:
-    """Extract movie cards from any listing page."""
     movies = []
     seen = set()
 
-    # Nkiri uses standard WordPress post structure
     for article in soup.select("article"):
-        a = article.select_one("a[rel='bookmark'], .entry-title a, h2 a, h3 a, a")
+        # Get the permalink anchor
+        a = (
+            article.select_one("a[rel='bookmark']")
+            or article.select_one(".entry-title a")
+            or article.select_one("h2 a")
+            or article.select_one("h3 a")
+            or article.find("a", href=True)
+        )
         if not a:
             continue
+
         href = a.get("href", "")
         if not href.startswith("http"):
             href = urljoin(BASE, href)
         if href in seen:
             continue
-        # Skip category / tag / page / search links
-        path = urlparse(href).path.strip("/")
-        if not path or "/" in path:
+        if any(x in href for x in ["/category/", "/tag/", "/page/", "/?s=", "#"]):
             continue
-        if any(x in href for x in ["/category/", "/tag/", "/page/", "/?", "#"]):
+        # Must be a single-slug post URL e.g. /movie-name/
+        path_parts = [p for p in urlparse(href).path.strip("/").split("/") if p]
+        if len(path_parts) != 1:
             continue
+
         seen.add(href)
 
-        title = a.get_text(strip=True) or a.get("title", "")
+        # Title — prefer entry-title, fall back to anchor text
+        title_el = article.select_one(".entry-title")
+        title = (title_el or a).get_text(strip=True)
+
+        # Thumbnail
         thumb = ""
-        img = article.select_one("img[data-src], img[src]")
+        img = article.select_one("img")
         if img:
-            thumb = img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")
+            thumb = (img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")).strip()
 
         movies.append({"title": title, "url": href, "thumbnail": thumb})
-
-    # Fallback: if articles not found, try generic anchor scan
-    if not movies:
-        for a in soup.select(".entry-title a, h2.post-title a, .post-thumbnail a"):
-            href = a.get("href", "")
-            if not href.startswith("http"):
-                href = urljoin(BASE, href)
-            if href in seen:
-                continue
-            path = urlparse(href).path.strip("/")
-            if not path or "/" in path:
-                continue
-            seen.add(href)
-            title = a.get_text(strip=True)
-            movies.append({"title": title, "url": href, "thumbnail": ""})
 
     return movies
 
 
+# ─── Movie info parser ────────────────────────────────────────────────────────
 def parse_movie_info(soup, page_url: str) -> dict:
+    # Title
     title = ""
     for sel in ["h1.entry-title", "h1.post-title", "h1"]:
         el = soup.select_one(sel)
@@ -124,6 +126,7 @@ def parse_movie_info(soup, page_url: str) -> dict:
             title = el.get_text(strip=True)
             break
 
+    # Thumbnail
     thumbnail = ""
     og = soup.find("meta", property="og:image")
     if og:
@@ -131,30 +134,37 @@ def parse_movie_info(soup, page_url: str) -> dict:
     if not thumbnail:
         img = soup.select_one(".entry-content img, .post-thumbnail img, article img")
         if img:
-            thumbnail = img.get("data-src") or img.get("src", "")
+            thumbnail = (img.get("data-src") or img.get("src", "")).strip()
 
+    # Description
     description = ""
-    og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
-    if og_desc:
-        description = og_desc.get("content", "").strip()
+    for meta_sel in [
+        {"property": "og:description"},
+        {"name": "description"},
+    ]:
+        m = soup.find("meta", attrs=meta_sel)
+        if m and m.get("content"):
+            description = m["content"].strip()
+            break
 
+    # Details — parse table rows and bold-colon patterns
     details = {}
     content = soup.select_one(".entry-content, .post-content")
     if content:
         for row in content.select("table tr"):
             cells = row.find_all(["td", "th"])
-            if len(cells) == 2:
+            if len(cells) >= 2:
                 k = cells[0].get_text(strip=True).lower().replace(" ", "_").rstrip(":")
                 v = cells[1].get_text(strip=True)
                 if k and v and len(k) < 40:
                     details[k] = v
-        # Also parse strong: value patterns
-        for p in content.select("p"):
+        for p in content.select("p, li"):
             text = p.get_text(" ", strip=True)
-            m = re.match(r"^([A-Za-z ]{2,25}):\s*(.+)$", text)
+            m = re.match(r"^([A-Za-z][A-Za-z ]{1,24}):\s*(.+)$", text)
             if m:
                 k = m.group(1).strip().lower().replace(" ", "_")
-                details[k] = m.group(2).strip()[:200]
+                if k not in details:
+                    details[k] = m.group(2).strip()[:300]
 
     return {
         "title": title,
@@ -165,175 +175,112 @@ def parse_movie_info(soup, page_url: str) -> dict:
     }
 
 
-# ─── Downloadwella resolver (XFilesharing Pro engine) ────────────────────────
-def resolve_downloadwella(s, page_url: str) -> dict | None:
+# ─── Downloadwella direct-link resolver ──────────────────────────────────────
+def resolve_downloadwella(s, dw_url: str) -> str | None:
     """
-    XFilesharing Pro two-step download flow:
-      Step 1: GET page  → extract hidden form fields (op, id, fname, hash, etc.)
-      Step 2: POST with op=download1 → get countdown page with more hidden fields
-      Step 3: POST with op=download2 → get redirect or direct link
-    Returns {"url": "...", "filename": "...", "size": "..."} or None
+    Downloadwella (XFilesharing Pro) flow — confirmed from debug output:
+
+    The page already serves a form with op=download2 pre-filled.
+    Just POST it directly → follow redirect → get direct file URL.
+
+    Form fields confirmed: op, id, rand, referer, method_free, method_premium
     """
-    log.info(f"  Resolving downloadwella: {page_url}")
-    file_host_base = urlparse(page_url).scheme + "://" + urlparse(page_url).netloc
+    log.info(f"    Resolving downloadwella: {dw_url}")
+    host_base = urlparse(dw_url).scheme + "://" + urlparse(dw_url).netloc
 
     try:
-        # ── Step 1: GET the file page ──────────────────────────────────────
-        r1 = get(s, page_url)
-        soup1 = BeautifulSoup(r1.text, "lxml")
+        # GET the downloadwella page
+        r1 = fetch(s, dw_url)
+        soup = BeautifulSoup(r1.text, "lxml")
 
-        # Extract filename and size from page
-        filename = ""
-        size = ""
-        fname_el = soup1.select_one(".name, .file_name, #file_title, h2, title")
-        if fname_el:
-            filename = fname_el.get_text(strip=True)
-        size_el = soup1.select_one(".size, .file_size, #file_size")
-        if size_el:
-            size = size_el.get_text(strip=True)
-
-        # Collect all hidden inputs from the free download form
-        form = (
-            soup1.select_one("form[name='F1']")
-            or soup1.select_one("form")
-        )
+        # Find the form — confirmed it has op=download2
+        form = soup.find("form")
         if not form:
-            log.warning("  No form found on downloadwella page")
+            log.warning("    No form on downloadwella page")
             return None
 
-        form_data = {}
+        # Collect all hidden inputs exactly as they are
+        data = {}
         for inp in form.find_all("input"):
             name = inp.get("name", "")
             value = inp.get("value", "")
             if name:
-                form_data[name] = value
+                data[name] = value
 
-        # Make sure we're doing free download
-        form_data["op"] = "download1"
-        form_data.pop("method_premium", None)
-        form_data["method_free"] = "Free Download"
+        # Ensure we post as free download
+        data["op"] = "download2"
+        data["method_free"] = "Free Download"
+        data.pop("method_premium", None)
 
-        form_action = form.get("action") or page_url
-        if not form_action.startswith("http"):
-            form_action = urljoin(file_host_base, form_action)
+        form_action = form.get("action", "").strip()
+        post_url = urljoin(host_base, form_action) if form_action else dw_url
 
-        # ── Step 2: POST download1 → countdown/confirmation page ──────────
-        time.sleep(1)  # brief pause
-        r2 = post(s, form_action, data=form_data, referer=page_url)
+        log.info(f"    POST {post_url}  data={data}")
+
+        # POST → should redirect to direct file URL
+        r2 = fetch_post(s, post_url, data=data, referer=dw_url)
+
+        # Check if we were redirected to a direct file URL
+        if r2.history:
+            for resp in list(r2.history) + [r2]:
+                if FILE_EXT_RE.search(resp.url):
+                    log.info(f"    Resolved via redirect: {resp.url}")
+                    return resp.url
+
+        # Check final URL
+        if FILE_EXT_RE.search(r2.url):
+            log.info(f"    Resolved final URL: {r2.url}")
+            return r2.url
+
+        # Scan response HTML for direct link
         soup2 = BeautifulSoup(r2.text, "lxml")
 
-        # Check for direct link in this response already
-        direct = _find_direct_link(soup2)
-        if direct:
-            return {"url": direct, "filename": filename, "size": size}
+        for a in soup2.find_all("a", href=True):
+            href = a["href"]
+            if FILE_EXT_RE.search(href) and href.startswith("http"):
+                log.info(f"    Resolved from anchor: {href}")
+                return href
 
-        # Extract hidden fields for step 3
-        form2 = (
-            soup2.select_one("form[name='F1']")
-            or soup2.select_one("form[id='F1']")
-            or soup2.select_one("form")
-        )
-        if not form2:
-            # Sometimes the link is right in the page without a second form
-            log.warning("  No second form on downloadwella — checking for link")
-            return None
+        for script in soup2.find_all("script"):
+            t = script.string or ""
+            m = re.search(r'["\']((https?://[^"\']{10,}\.(?:mp4|mkv|avi|webm))[^"\']*)["\']', t, re.I)
+            if m:
+                log.info(f"    Resolved from JS: {m.group(1)}")
+                return m.group(1)
 
-        form2_data = {}
-        for inp in form2.find_all("input"):
-            name = inp.get("name", "")
-            value = inp.get("value", "")
-            if name:
-                form2_data[name] = value
-
-        form2_data["op"] = "download2"
-        form2_data.pop("method_premium", None)
-        form2_data["method_free"] = "Free Download"
-
-        form2_action = form2.get("action") or page_url
-        if not form2_action.startswith("http"):
-            form2_action = urljoin(file_host_base, form2_action)
-
-        # ── Step 3: POST download2 → actual file link ──────────────────────
-        wait = _parse_countdown(soup2)
-        if wait > 0:
-            log.info(f"  Waiting {wait}s countdown...")
-            time.sleep(min(wait, 15))  # cap at 15s for API responsiveness
-
-        r3 = post(s, form2_action, data=form2_data, referer=r2.url)
-        soup3 = BeautifulSoup(r3.text, "lxml")
-
-        # Check for redirect
-        if r3.history:
-            final_url = r3.url
-            if FILE_EXT_RE.search(final_url):
-                return {"url": final_url, "filename": filename, "size": size}
-
-        direct = _find_direct_link(soup3)
-        if direct:
-            return {"url": direct, "filename": filename, "size": size}
-
-        # Last resort: check response headers for Location
-        loc = r3.headers.get("Location", "")
+        # Check Location header
+        loc = r2.headers.get("Location", "")
         if loc and FILE_EXT_RE.search(loc):
-            return {"url": loc, "filename": filename, "size": size}
+            return loc
 
-        log.warning("  Could not extract direct link from downloadwella")
+        # Last resort: look for any download link on response page
+        for a in soup2.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and "downloadwella.com" not in href and "thenkiri" not in href:
+                text = a.get_text(strip=True).lower()
+                if "download" in text or FILE_EXT_RE.search(href):
+                    log.info(f"    Resolved from fallback anchor: {href}")
+                    return href
+
+        log.warning(f"    Could not resolve direct link. Response URL: {r2.url}")
+        log.warning(f"    Response snippet: {r2.text[:500]}")
         return None
 
     except Exception as e:
-        log.error(f"  Downloadwella resolve error: {e}")
+        log.error(f"    downloadwella error: {e}")
         return None
 
 
-def _find_direct_link(soup) -> str:
-    """Search a soup for a direct .mp4/.mkv/.avi link."""
-    # In <a> tags
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if FILE_EXT_RE.search(href) and href.startswith("http"):
-            return href
-    # In scripts
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        m = re.search(r'["\']((https?://[^"\']{10,}\.(?:mp4|mkv|avi|webm))[^"\']*)["\']', text, re.I)
-        if m:
-            return m.group(1)
-    # Direct URL in page text
-    m = re.search(r'(https?://\S+\.(?:mp4|mkv|avi|webm))(?:\s|")', soup.get_text())
-    if m:
-        return m.group(1)
-    return ""
-
-
-def _parse_countdown(soup) -> int:
-    """Extract countdown seconds from XFilesharing countdown page."""
-    # Common patterns: id="countdown", var countdown = 30, etc.
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        m = re.search(r'(?:countdown|count|wait)\s*[=:]\s*(\d+)', text, re.I)
-        if m:
-            return int(m.group(1))
-    el = soup.select_one("#countdown, .countdown, #timer")
-    if el:
-        m = re.search(r'\d+', el.get_text())
-        if m:
-            return int(m.group(0))
-    return 5  # default safe wait
-
-
-# ─── Main download resolver (called per movie page) ───────────────────────────
-def resolve_download_links(s, page_url: str) -> list[dict]:
+# ─── Main download link collector ────────────────────────────────────────────
+def get_download_links(s, nkiri_page_url: str) -> list[dict]:
     """
-    Two-stage resolution:
-      Stage 1: Scrape Nkiri movie page → find downloadwella.com links
-      Stage 2: For each downloadwella link → POST through XFilesharing → get direct file URL
-    Returns list of {label, url, host, filename, size}
+    1. Fetch the Nkiri movie page
+    2. Find all downloadwella.com links in the content area
+    3. Resolve each one to a direct file URL via POST
     """
-    log.info(f"Fetching movie page: {page_url}")
-    r = get(s, page_url)
+    r = fetch(s, nkiri_page_url)
     soup = BeautifulSoup(r.text, "lxml")
 
-    # Scope to content area
     content = (
         soup.select_one(".entry-content")
         or soup.select_one(".post-content")
@@ -341,135 +288,143 @@ def resolve_download_links(s, page_url: str) -> list[dict]:
         or soup
     )
 
-    # Find downloadwella links (and any other file host links)
     dw_links = []
-    other_links = []
+    direct_links = []
     seen = set()
 
     for a in content.find_all("a", href=True):
         href = a["href"].strip()
-        text = a.get_text(strip=True)
+        label = a.get_text(strip=True)
 
-        if not href or href in seen or href.startswith("javascript") or href == "#":
+        if not href or href in seen:
             continue
-        if "thenkiri.com.ng" in href:  # skip internal links
+        if href.startswith("javascript") or href == "#":
+            continue
+        if "thenkiri.com.ng" in href:
             continue
 
         seen.add(href)
 
         if "downloadwella.com" in href:
-            dw_links.append({"href": href, "label": text or "Download"})
-        elif FILE_EXT_RE.search(href):
-            other_links.append({"label": text or "Direct Download", "url": href,
-                                 "host": urlparse(href).netloc.replace("www.", ""),
-                                 "filename": "", "size": ""})
+            dw_links.append({"href": href, "label": label})
+        elif FILE_EXT_RE.search(href) and href.startswith("http"):
+            direct_links.append({
+                "label": label or "Direct Download",
+                "url": href,
+                "host": urlparse(href).netloc.replace("www.", ""),
+                "filename": href.split("/")[-1].split("?")[0],
+                "size": "",
+            })
 
     results = []
 
-    # Resolve each downloadwella link → direct file URL
     for item in dw_links:
-        resolved = resolve_downloadwella(s, item["href"])
-        if resolved:
+        direct_url = resolve_downloadwella(s, item["href"])
+        if direct_url:
+            filename = direct_url.split("/")[-1].split("?")[0]
             results.append({
-                "label": item["label"] or resolved.get("filename", "Download"),
-                "url": resolved["url"],
-                "host": "downloadwella.com",
-                "filename": resolved.get("filename", ""),
-                "size": resolved.get("size", ""),
+                "label": item["label"] or filename or "Download",
+                "url": direct_url,
+                "host": urlparse(direct_url).netloc.replace("www.", ""),
+                "filename": filename,
+                "size": "",
             })
         else:
-            # Fallback: return the downloadwella page URL itself
+            # Couldn't resolve — return the downloadwella page URL as fallback
             results.append({
                 "label": item["label"] or "Download",
                 "url": item["href"],
                 "host": "downloadwella.com",
                 "filename": "",
                 "size": "",
+                "note": "could not resolve to direct link",
             })
 
-    # Append any other direct links found
-    results.extend(other_links)
-
+    results.extend(direct_links)
     return results
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.route("/api/movies")
+@limiter.limit("30 per minute")
+def all_movies():
+    """
+    GET /api/movies
+    GET /api/movies?page=2
+    GET /api/movies?category=hollywood
+    GET /api/movies?category=korean-drama&page=3
+
+    Response: { results:[{title,url,thumbnail}], count, page, next_page, categories }
+    """
+    page     = request.args.get("page", "1").strip()
+    category = request.args.get("category", "").strip()
+
+    if category:
+        url = f"{BASE}/category/{category}/page/{page}/" if page != "1" else f"{BASE}/category/{category}/"
+    else:
+        url = f"{BASE}/page/{page}/" if page != "1" else BASE
+
+    log.info(f"MOVIES  category={category!r}  page={page}  → {url}")
+
+    try:
+        s = make_session()
+        r = fetch(s, url)
+    except Exception as e:
+        return jsonify({"error": "Failed to reach Nkiri", "detail": str(e)}), 502
+
+    soup = BeautifulSoup(r.text, "lxml")
+    results = parse_movie_cards(soup)
+
+    has_next = bool(soup.select_one("a.next, a[rel='next'], .nav-next a, .next.page-numbers"))
+    next_page = str(int(page) + 1) if has_next else None
+
+    cats = []
+    seen_slugs = set()
+    for a in soup.select(".cat-item a, .categories a, nav .menu-item a"):
+        href = a.get("href", "")
+        m = re.search(r"/category/([^/]+)/?", href)
+        if m and m.group(1) not in seen_slugs:
+            seen_slugs.add(m.group(1))
+            cats.append({"name": a.get_text(strip=True), "slug": m.group(1)})
+
+    return jsonify({
+        "results":    results,
+        "count":      len(results),
+        "page":       page,
+        "next_page":  next_page,
+        "categories": cats,
+    })
+
+
 @app.route("/api/search")
 @limiter.limit("30 per minute")
 def search():
     """
     GET /api/search?q=avatar
     GET /api/search?q=avatar&page=2
-    Returns: { results: [{title, url, thumbnail}], count, query }
+
+    Response: { results:[{title,url,thumbnail}], count, query, page }
     """
-    q = request.args.get("q", "").strip()
-    page = request.args.get("page", "1")
+    q    = request.args.get("q", "").strip()
+    page = request.args.get("page", "1").strip()
+
     if not q or len(q) < 2:
         return jsonify({"error": "Query too short"}), 400
 
     url = f"{BASE}/?s={q.replace(' ', '+')}&paged={page}"
-    log.info(f"SEARCH q={q!r} page={page}")
+    log.info(f"SEARCH  q={q!r}  page={page}")
 
     try:
-        s = session()
-        r = get(s, url)
+        s = make_session()
+        r = fetch(s, url)
     except Exception as e:
         return jsonify({"error": "Failed to reach Nkiri", "detail": str(e)}), 502
 
     soup = BeautifulSoup(r.text, "lxml")
     results = parse_movie_cards(soup)
+
     return jsonify({"results": results, "count": len(results), "query": q, "page": page})
-
-
-@app.route("/api/movies")
-@limiter.limit("30 per minute")
-def all_movies():
-    """
-    GET /api/movies                   - latest (homepage)
-    GET /api/movies?page=2            - paginated
-    GET /api/movies?category=hollywood  - by category slug
-    GET /api/movies?category=korean-drama&page=3
-
-    Returns: { results: [{title, url, thumbnail}], count, page, next_page }
-    """
-    page = request.args.get("page", "1")
-    category = request.args.get("category", "").strip()
-
-    if category:
-        url = f"{BASE}/category/{category}/page/{page}/"
-    else:
-        url = f"{BASE}/page/{page}/" if page != "1" else BASE
-
-    log.info(f"MOVIES category={category!r} page={page}")
-
-    try:
-        s = session()
-        r = get(s, url)
-    except Exception as e:
-        return jsonify({"error": "Failed to reach Nkiri", "detail": str(e)}), 502
-
-    soup = BeautifulSoup(r.text, "lxml")
-    results = parse_movie_cards(soup)
-
-    # Detect if there's a next page
-    has_next = bool(soup.select_one("a.next, a[rel='next'], .nav-next a, .next.page-numbers"))
-    next_page = str(int(page) + 1) if has_next else None
-
-    # Available categories from nav (helpful for callers)
-    categories = []
-    for a in soup.select(".categories a, .cat-item a, nav .menu-item a"):
-        href = a.get("href", "")
-        m = re.search(r"/category/([^/]+)/", href)
-        if m:
-            categories.append({"name": a.get_text(strip=True), "slug": m.group(1)})
-
-    return jsonify({
-        "results": results,
-        "count": len(results),
-        "page": page,
-        "next_page": next_page,
-        "categories": categories,
-    })
 
 
 @app.route("/api/movie")
@@ -477,7 +432,8 @@ def all_movies():
 def movie_info():
     """
     GET /api/movie?url=https://thenkiri.com.ng/avatar/
-    Returns: { title, url, thumbnail, description, details }
+
+    Response: { title, url, thumbnail, description, details }
     """
     page_url = request.args.get("url", "").strip()
     if not page_url:
@@ -485,10 +441,10 @@ def movie_info():
     if not is_nkiri(page_url):
         return jsonify({"error": "Only thenkiri.com.ng URLs accepted"}), 400
 
-    log.info(f"MOVIE {page_url}")
+    log.info(f"MOVIE   {page_url}")
     try:
-        s = session()
-        r = get(s, page_url)
+        s = make_session()
+        r = fetch(s, page_url)
     except Exception as e:
         return jsonify({"error": "Failed to fetch page", "detail": str(e)}), 502
 
@@ -502,13 +458,11 @@ def download():
     """
     GET /api/download?url=https://thenkiri.com.ng/avatar/
 
-    Scrapes the Nkiri page → finds downloadwella.com links →
-    resolves each one through XFilesharing POST flow →
-    returns direct .mkv/.mp4 URLs that trigger browser download immediately.
+    Fetches the Nkiri page → finds downloadwella links → POSTs through
+    XFilesharing to get the direct .mkv/.mp4 URL → returns it.
+    Always live, never cached.
 
-    Links are NEVER cached — always live.
-
-    Returns: { title, url, links: [{label, url, host, filename, size}], count, fetched_at }
+    Response: { title, url, links:[{label,url,host,filename,size}], count, fetched_at }
     """
     page_url = request.args.get("url", "").strip()
     if not page_url:
@@ -518,27 +472,24 @@ def download():
 
     log.info(f"DOWNLOAD {page_url}")
     try:
-        s = session()
-        links = resolve_download_links(s, page_url)
+        s = make_session()
+        links = get_download_links(s, page_url)
+
+        # Also grab title while we have the session
+        r = fetch(s, page_url)
+        soup = BeautifulSoup(r.text, "lxml")
+        info = parse_movie_info(soup, page_url)
+        title = info.get("title", "")
+
     except Exception as e:
-        log.error(f"Download resolve error: {e}")
+        log.error(f"Download error: {e}")
         return jsonify({"error": "Failed to resolve download links", "detail": str(e)}), 502
 
-    # Get title
-    title = ""
-    try:
-        r = get(s, page_url)
-        h1 = BeautifulSoup(r.text, "lxml").find("h1")
-        if h1:
-            title = h1.get_text(strip=True)
-    except Exception:
-        pass
-
     return jsonify({
-        "title": title,
-        "url": page_url,
-        "links": links,
-        "count": len(links),
+        "title":      title,
+        "url":        page_url,
+        "links":      links,
+        "count":      len(links),
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
 
@@ -550,73 +501,44 @@ def health():
 
 @app.route("/api/debug")
 def debug():
-    """
-    TEMPORARY — dumps raw HTML from a URL so we can see what the server actually receives.
-    Usage:
-      GET /api/debug?url=https://thenkiri.com.ng/avatar/
-      GET /api/debug?url=https://thenkiri.com.ng/
-      GET /api/debug?url=https://downloadwella.com/g2jm30mfdu7b/Project.Hail.Mary.(THENKIRI.COM).2026.WEBRip.DOWNLOADED.FROM.THENKIRI.COM.mkv.html
-
-    Returns raw HTML + all links and forms found on the page.
-    DELETE this endpoint once scraping is confirmed working.
-    """
+    """Temporary — dumps raw HTML so you can inspect what the server sees."""
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"error": "url required"}), 400
-
     try:
-        s = session()
+        s = make_session()
         r = s.get(url, timeout=30)
-        html = r.text
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(r.text, "lxml")
 
-        # All links on the page
-        all_links = []
-        for a in soup.find_all("a", href=True):
-            all_links.append({
-                "text": a.get_text(strip=True)[:80],
-                "href": a["href"][:200],
-            })
-
-        # All forms + their inputs
-        all_forms = []
+        links = [{"text": a.get_text(strip=True)[:80], "href": a["href"][:200]}
+                 for a in soup.find_all("a", href=True)]
+        forms = []
         for form in soup.find_all("form"):
-            inputs = []
-            for inp in form.find_all("input"):
-                inputs.append({
-                    "type": inp.get("type"),
-                    "name": inp.get("name"),
-                    "value": (inp.get("value") or "")[:100],
-                })
-            all_forms.append({
-                "action": form.get("action"),
-                "method": form.get("method"),
-                "inputs": inputs,
-            })
+            inputs = [{"type": i.get("type"), "name": i.get("name"), "value": (i.get("value") or "")[:100]}
+                      for i in form.find_all("input")]
+            forms.append({"action": form.get("action"), "method": form.get("method"), "inputs": inputs})
 
-        # Article tags found (for movie card parsing)
         articles = []
         for art in soup.find_all("article")[:5]:
             a = art.find("a", href=True)
             img = art.find("img")
             articles.append({
                 "classes": art.get("class", []),
-                "first_link": a["href"] if a else None,
-                "first_link_text": a.get_text(strip=True)[:80] if a else None,
-                "img_src": (img.get("data-src") or img.get("src", ""))[:200] if img else None,
+                "link": a["href"] if a else None,
+                "link_text": a.get_text(strip=True)[:80] if a else None,
+                "img": (img.get("data-src") or img.get("src", ""))[:200] if img else None,
             })
 
         return jsonify({
             "status_code": r.status_code,
             "final_url": r.url,
-            "html_length": len(html),
-            "html_snippet": html[:3000],
-            "all_links": all_links[:60],
-            "all_forms": all_forms,
+            "html_length": len(r.text),
+            "html_snippet": r.text[:4000],
             "articles_found": len(soup.find_all("article")),
             "articles_sample": articles,
             "entry_content_found": bool(soup.select_one(".entry-content")),
-            "post_content_found": bool(soup.select_one(".post-content")),
+            "all_links": links[:60],
+            "all_forms": forms,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -117,40 +117,47 @@ def is_nkiri(url):
 
 # ─── Movie card parser ────────────────────────────────────────────────────────
 def parse_movie_cards(soup) -> list[dict]:
+    # Nkiri uses a theme with NO <article> tags.
+    # Movies are plain <a href="/slug/"> links.
+    # Identify them by their URL slug pattern.
+    MOVIE_SLUG_RE = re.compile(
+        r'https://thenkiri\.com\.ng/[a-z0-9][\w-]+'
+        r'(?:download|korean-drama|tv-series|chinese-drama|thai-drama|k-drama|'
+        r'bollywood|nollywood|hollywood|anime|foreign|s\d{2})[\w-]*/?\s*$',
+        re.I
+    )
+
     movies = []
-    seen = set()
+    seen_urls = set()
 
-    for article in soup.select("article"):
-        a = (
-            article.select_one("a[rel='bookmark']")
-            or article.select_one(".entry-title a")
-            or article.select_one("h2 a")
-            or article.select_one("h3 a")
-            or article.find("a", href=True)
-        )
-        if not a:
-            continue
-        href = a.get("href", "")
-        if not href.startswith("http"):
-            href = urljoin(BASE, href)
-        if href in seen:
-            continue
-        if any(x in href for x in ["/category/", "/tag/", "/page/", "/?s=", "#"]):
-            continue
-        parts = [p for p in urlparse(href).path.strip("/").split("/") if p]
-        if len(parts) != 1:
-            continue
-        seen.add(href)
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        text = a.get_text(strip=True)
 
-        title_el = article.select_one(".entry-title")
-        title = (title_el or a).get_text(strip=True)
+        if not href or href in seen_urls:
+            continue
+        if not href.startswith("https://thenkiri.com.ng/"):
+            continue
+        if any(x in href for x in ["/category/", "/tag/", "/page/", "/?", "#", "/login", "/wp-"]):
+            continue
+        if not text or len(text) < 5:
+            continue
+        if not MOVIE_SLUG_RE.search(href):
+            continue
 
+        seen_urls.add(href)
+
+        # Find nearby thumbnail
         thumb = ""
-        img = article.select_one("img")
-        if img:
-            thumb = (img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")).strip()
+        parent = a.find_parent(["div", "li", "article", "figure"])
+        if parent:
+            img = parent.find("img")
+            if img:
+                thumb = (img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")).strip()
+                if thumb and (thumb.startswith("data:") or len(thumb) < 20):
+                    thumb = ""
 
-        movies.append({"title": title, "url": href, "thumbnail": thumb})
+        movies.append({"title": text, "url": href, "thumbnail": thumb})
 
     return movies
 

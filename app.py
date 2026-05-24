@@ -187,32 +187,39 @@ def parse_movie_info(soup, page_url):
     }
 
 
-# ── Find omg10 links in Nkiri page ────────────────────────────────────────────
+# ── Find download buttons via data-attributes JSON ───────────────────────────
 def find_omg10_links(soup, body):
-    links, seen = [], set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if "omg10.com" not in href or href in seen:
-            continue
-        seen.add(href)
-        label = a.get_text(strip=True)
-        idx = body.find(href)
-        if idx != -1:
-            ctx = body[max(0, idx - 300):idx + 300]
-            for q in ["2160p", "4K", "1080p", "720p", "480p", "BluRay", "WEBRip", "WEB-DL"]:
-                if q.lower() in ctx.lower():
-                    label = label or f"Download {q}"
-                    break
-        links.append({"url": href, "label": label or "Download"})
+    """
+    Nkiri stores download URLs in data-attributes JSON on div.wp-block-btn-button
+    e.g. data-attributes={"url":"https://downloadwella.com/...","text":"DOWNLOAD MOVIE"}
+    This is parsed directly — no need to go through omg10 ad interstitial at all.
+    """
+    import html as html_module, json as json_module
+    results, seen = [], set()
 
-    # Also scan raw body for omg10 URLs not in anchor tags
-    for m in re.finditer(r'https?://(?:www\.)?omg10\.com/\d+/\d+', body):
-        url = m.group(0)
+    for tag in soup.find_all(True, attrs={"data-attributes": True}):
+        raw = tag.get("data-attributes", "")
+        if not raw:
+            continue
+        try:
+            decoded = html_module.unescape(raw)
+            obj = json_module.loads(decoded)
+            url = obj.get("url", "").replace("\\/", "/").replace("\/", "/").strip()
+            label = obj.get("text", "Download").strip() or "Download"
+            if url and url not in seen:
+                seen.add(url)
+                results.append({"url": url, "label": label})
+        except Exception:
+            pass
+
+    # Fallback: also scan raw body for downloadwella URLs not caught above
+    for m in re.finditer(r'https?://(?:www\.)?downloadwella\.com/[^\s\'"<>\\]+', body):
+        url = m.group(0).rstrip(".,;)")
         if url not in seen:
             seen.add(url)
-            links.append({"url": url, "label": "Download"})
+            results.append({"url": url, "label": "Download"})
 
-    return links
+    return results
 
 
 # ── Resolve omg10 → downloadwella ─────────────────────────────────────────────
@@ -322,36 +329,44 @@ def get_download_links(s, nkiri_url):
     info = parse_movie_info(soup, nkiri_url)
     title = info.get("title", "")
 
-    omg_links = find_omg10_links(soup, body)
-    log.info(f"Found {len(omg_links)} omg10 links")
+    # find_omg10_links now extracts downloadwella URLs directly from
+    # data-attributes JSON on the download button divs — no omg10 needed
+    dw_items = find_omg10_links(soup, body)
+    log.info(f"Found {len(dw_items)} downloadwella links via data-attributes")
 
     results = []
-    for item in omg_links:
-        dw_url = resolve_omg10(s, item["url"])
-        if not dw_url:
-            results.append({
-                "label": item["label"], "url": item["url"],
-                "host": "omg10.com", "note": "ad interstitial blocked on cloud IP",
-            })
-            continue
+    for item in dw_items:
+        dw_url = item["url"]
 
-        direct = resolve_downloadwella(s, dw_url)
-        if direct:
-            filename = unquote(direct.split("/")[-1].split("?")[0])
-            results.append({
-                "label": item["label"] or filename,
-                "url": direct,
-                "host": urlparse(direct).netloc.replace("www.", ""),
-                "filename": filename, "size": "",
-            })
+        if "downloadwella.com" in dw_url:
+            direct = resolve_downloadwella(s, dw_url)
+            if direct:
+                filename = unquote(direct.split("/")[-1].split("?")[0])
+                results.append({
+                    "label": item["label"] or filename,
+                    "url": direct,
+                    "host": urlparse(direct).netloc.replace("www.", ""),
+                    "filename": filename,
+                    "size": "",
+                })
+            else:
+                # Return the downloadwella page URL as fallback
+                # (user can still click through manually)
+                results.append({
+                    "label": item["label"],
+                    "url": dw_url,
+                    "host": "downloadwella.com",
+                    "note": "direct link resolution failed — click to download manually",
+                })
         else:
+            # Non-downloadwella link (rare), return as-is
             results.append({
-                "label": item["label"], "url": dw_url,
-                "host": "downloadwella.com",
-                "note": "downloadwella POST did not return direct link",
+                "label": item["label"],
+                "url": dw_url,
+                "host": urlparse(dw_url).netloc.replace("www.", ""),
             })
 
-    # Plain direct links in content
+    # Also catch any plain .mp4/.mkv links in content
     content = soup.select_one(".entry-content, .post-content") or soup
     seen_urls = {r["url"] for r in results}
     for a in content.find_all("a", href=True):
@@ -362,7 +377,8 @@ def get_download_links(s, nkiri_url):
                     "label": a.get_text(strip=True) or "Direct Download",
                     "url": href,
                     "host": urlparse(href).netloc.replace("www.", ""),
-                    "filename": href.split("/")[-1].split("?")[0], "size": "",
+                    "filename": href.split("/")[-1].split("?")[0],
+                    "size": "",
                 })
 
     return title, results
